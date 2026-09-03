@@ -1,0 +1,131 @@
+use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use chrono::{DateTime, Utc, Datelike};
+use tokio;
+use serde_json::json;
+
+struct FundingPipsBot {
+    initial_daily_balance: f64,
+    current_balance: f64,
+    max_daily_loss_limit: f64,
+    is_trading_halted: Arc<AtomicBool>,
+    last_trade_day: u32,
+    last_reset_day: u32,
+    api_key: String,
+    api_secret: String,
+}
+
+impl FundingPipsBot {
+    pub fn new(starting_balance: f64, api_key: String, api_secret: String) -> Self {
+        let current_day = Utc::now().day();
+        Self {
+            initial_daily_balance: starting_balance,
+            current_balance: starting_balance,
+            max_daily_loss_limit: 4.0,
+            is_trading_halted: Arc::new(AtomicBool::new(false)),
+            last_trade_day: 0,
+            last_reset_day: current_day,
+            api_key,
+            api_secret,
+        }
+    }
+
+    pub fn get_broker_server_time(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    pub fn check_daily_reset(&mut self, latest_balance: f64) {
+        let server_time = self.get_broker_server_time();
+        let today = server_time.day();
+
+        if today != self.last_reset_day {
+            self.initial_daily_balance = latest_balance;
+            self.current_balance = latest_balance;
+            self.is_trading_halted.store(false, Ordering::SeqCst);
+            self.last_reset_day = today;
+            println!("📅 [Server Time]: New trading day started. Balance and trading state reset.");
+        }
+    }
+
+    pub fn can_open_new_trade(&self) -> bool {
+        let server_time = self.get_broker_server_time();
+        let today = server_time.day();
+
+        let not_halted = !self.is_trading_halted.load(Ordering::SeqCst);
+        let no_trade_today_yet = today != self.last_trade_day;
+
+        not_halted && no_trade_today_yet
+    }
+
+    pub async fn execute_daily_trade(&mut self) {
+        if self.can_open_new_trade() {
+            let server_time = self.get_broker_server_time();
+            self.last_trade_day = server_time.day();
+
+            println!("🚀 Executing today's single trade at broker time: {}", server_time);
+            self.send_order_to_broker().await;
+        } else {
+            println!("⏳ Trade skipped: Bot is either halted or a trade was already executed today.");
+        }
+    }
+
+    pub async fn send_order_to_broker(&self) {
+        let client = reqwest::Client::new();
+        let payload = json!({
+            "symbol": "EURUSD",
+            "action": "BUY",
+            "volume": 1.0
+        });
+
+        let res = client.post("https://api.broker-platform.com/v1/order")
+            .header("X-API-Key", &self.api_key)
+            .header("X-API-Secret", &self.api_secret)
+            .json(&payload)
+            .send()
+            .await;
+
+        match res {
+            Ok(response) => println!("✅ Order response status: {}", response.status()),
+            Err(err) => println!("❌ Failed to send order: {}", err),
+        }
+    }
+
+    pub fn update_balance(&mut self, new_balance: f64) {
+        self.check_daily_reset(new_balance);
+        self.current_balance = new_balance;
+
+        let daily_loss = self.initial_daily_balance - self.current_balance;
+        let daily_loss_percentage = (daily_loss / self.initial_daily_balance) * 100.0;
+
+        if daily_loss_percentage >= self.max_daily_loss_limit {
+            self.trigger_emergency_stop();
+        }
+    }
+
+    fn trigger_emergency_stop(&self) {
+        self.is_trading_halted.store(true, Ordering::SeqCst);
+        println!("🚨 Critical Alert: Daily loss reached 4% limit.");
+        println!("🛑 Bot locked to prevent further trades today and protect Funding Pips account.");
+        self.close_all_positions();
+    }
+
+    fn close_all_positions(&self) {
+        println!("🔒 Emergency close triggered for all open positions.");
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    println!("⚡ Starting Funding Pips Ultra-Fast Trading Bot...");
+
+    let api_key = env::var("BROKER_API_KEY").unwrap_or_else(|_| "TEST_KEY".to_string());
+    let api_secret = env::var("BROKER_API_SECRET").unwrap_or_else(|_| "TEST_SECRET".to_string());
+
+    let initial_balance = 100000.0;
+    
+    let mut bot = FundingPipsBot::new(initial_balance, api_key, api_secret);
+
+    bot.update_balance(100000.0);
+    bot.execute_daily_trade().await;
+}
